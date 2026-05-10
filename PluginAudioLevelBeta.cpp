@@ -16,6 +16,9 @@
 #include <cmath>
 #include <cassert>
 #include <vector>
+#include <algorithm>
+#include <atomic>
+#include <mutex>
 
 #include <thread>
 #include <chrono>
@@ -56,6 +59,61 @@ Channel=R
 #define EXIT_ON_ERROR(hres)		if (FAILED(hres)) { goto Exit; }
 #define SAFE_RELEASE(p)			if ((p) != NULL) { (p)->Release(); (p) = NULL; }
 #define CLAMP01(x)				max(0.0, min(1.0, (x)))
+
+struct Measure;
+
+class DefaultDeviceNotificationClient : public IMMNotificationClient
+{
+public:
+	DefaultDeviceNotificationClient(Measure* measure) :
+		m_refCount(1),
+		m_measure(measure)
+	{
+	}
+
+	ULONG STDMETHODCALLTYPE AddRef() override
+	{
+		return ++m_refCount;
+	}
+
+	ULONG STDMETHODCALLTYPE Release() override
+	{
+		ULONG refCount = --m_refCount;
+		if (refCount == 0)
+		{
+			delete this;
+		}
+		return refCount;
+	}
+
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
+	{
+		if (!ppvObject)
+		{
+			return E_POINTER;
+		}
+
+		if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient))
+		{
+			*ppvObject = static_cast<IMMNotificationClient*>(this);
+			AddRef();
+			return S_OK;
+		}
+
+		*ppvObject = NULL;
+		return E_NOINTERFACE;
+	}
+
+	HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId) override;
+	HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR pwstrDeviceId) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR pwstrDeviceId) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR pwstrDeviceId, const PROPERTYKEY key) override { return S_OK; }
+
+private:
+	std::atomic<ULONG> m_refCount;
+	Measure* m_measure;
+};
 
 struct Measure
 {
@@ -134,6 +192,7 @@ struct Measure
 	int						m_dynamicVolume;			// enable dynamic volume (parsed from options)
 	UINT32					m_nFramesNext;				// number of frames obtained on the UpdateParent call
 	UINT32					m_nSilentFrames;			// number of silent frames, used to calculate when to stop updating
+	UINT32					m_nEmptyPacketCycles;		// number of update cycles with no available packets
 	double					m_gainRMS;					// RMS gain (parsed from options)
 	double					m_gainPeak;					// peak gain (parsed from options)
 	double					m_freqMin;					// min freq for band measurement
@@ -157,6 +216,7 @@ struct Measure
 	HANDLE					m_hStopEvent;				// skin closed handle to receive notifications
 	HANDLE					m_hTask;					// Multimedia Class Scheduler Service task
 	std::thread*			m_updateLoopThread;			// thread for running the update loop
+	std::mutex				m_mutex;					// protects device state and output buffers
 	std::chrono::system_clock::time_point
 							m_lastUpdate;				// time of last rainmeter update
 	std::chrono::duration<double>
@@ -193,6 +253,11 @@ struct Measure
 	float					m_bandScalar;				// band scalar
 	float					m_waveScalar;				// wave scalar
 	float					m_smoothingScalar;			// smoothing scalar
+	bool					m_wfxAllocated;				// true when m_wfx must be freed with CoTaskMemFree
+	bool					m_usingDefaultDevice;		// true when blank ID or requested ID fallback uses default device
+	bool					m_outputsSilenced;			// true after stale output buffers have been cleared
+	DefaultDeviceNotificationClient*
+							m_notificationClient;		// default endpoint change callback
 
 	Measure() :
 		m_port(PORT_OUTPUT),
@@ -217,6 +282,7 @@ struct Measure
 		m_ringBufferSize(0),
 		m_nFramesNext(0),
 		m_nSilentFrames(0),
+		m_nEmptyPacketCycles(0),
 		m_dynamicVolume(0),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
@@ -243,11 +309,16 @@ struct Measure
 		m_updateLoopThread(NULL),
 		m_waitUpdate(NULL),
 		m_overheadUpdate(NULL),
+		m_updatesPerSecond(-1.0),
 		m_fftKWdw(NULL),
 		m_ringBufOut(NULL),
 		m_fftTmpOut(NULL),
 		m_ringBufW(0),
-		m_bandFreq(NULL)
+		m_bandFreq(NULL),
+		m_wfxAllocated(false),
+		m_usingDefaultDevice(false),
+		m_outputsSilenced(true),
+		m_notificationClient(NULL)
 	{
 		m_envRMS[0] = 300;
 		m_envRMS[1] = 300;
@@ -277,7 +348,15 @@ struct Measure
 	}
 
 	HRESULT DeviceInit();
-	void DeviceRelease();
+	void DeviceRelease(bool stopThread = true, bool releaseProcessing = true);
+	HRESULT SelectDevice();
+	HRESULT InitializeAnalysisBuffers();
+	void ReleaseAnalysisBuffers();
+	void StartCaptureThread();
+	void OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR defaultDeviceId);
+	HRESULT ReinitializeDevice();
+	UINT32 EmptyPacketSilenceThreshold() const;
+	void ZeroOutputBuffers();
 	HRESULT UpdateParent();
 
 	void DoCaptureLoop();
@@ -303,15 +382,28 @@ void Measure::DoCaptureLoop()
 	{
 		DWORD dwErr = GetLastError();
 		RmLog(m_rm, LOG_WARNING, L"Failed to start multimedia task.");
+		m_hTask = NULL;
 		return;
 	}
 
-	HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
-
 	while (1)
 	{
-		if (WAIT_OBJECT_0 != WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, INFINITE))
-			return;
+		HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
+		DWORD waitTimeout = 50;
+		if (m_updatesPerSecond > 0)
+		{
+			waitTimeout = (DWORD)max(1.0, ceil(1000.0 / m_updatesPerSecond));
+		}
+
+		DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, waitTimeout);
+		if (waitResult == WAIT_OBJECT_0 + 1)
+		{
+			break;
+		}
+		if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_TIMEOUT)
+		{
+			break;
+		}
 
 		// update parent seperated from measure update function
 		HRESULT hr = UpdateParent();
@@ -352,10 +444,15 @@ void Measure::DoCaptureLoop()
 		case AUDCLNT_E_BUFFER_ERROR:
 		case AUDCLNT_E_DEVICE_INVALIDATED:
 		case AUDCLNT_E_SERVICE_NOT_RUNNING:
-			// error detected, release device
-			DeviceRelease();
+			ReinitializeDevice();
 			break;
 		}
+	}
+
+	if (m_hTask)
+	{
+		AvRevertMmThreadCharacteristics(m_hTask);
+		m_hTask = NULL;
 	}
 }
 
@@ -370,6 +467,7 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 {
 	Measure* m = new Measure;
 	m->m_skin = RmGetSkin(rm);
+	m->m_rm = rm;
 	m->m_rmName = RmGetMeasureName(rm);
 	*data = m;
 
@@ -427,23 +525,10 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		_snwprintf_s(m->m_reqID, _TRUNCATE, L"%s", reqID);
 	}
 
-	// if a specific ID was requested, search for that one, otherwise get the default
-	if (*m->m_reqID)
-	{
-		HRESULT hr = m->m_enum->GetDevice(m->m_reqID, &m->m_dev);
-		if (hr != S_OK)
-		{
-			WCHAR msg[256];
-			_snwprintf_s(msg, _TRUNCATE, L"Audio %s device '%s' not found (error 0x%08x).",
-				m->m_port == Measure::PORT_OUTPUT ? L"output" : L"input", m->m_reqID, hr);
+	EXIT_ON_ERROR(m->SelectDevice());
 
-			RmLog(rm, LOG_WARNING, msg);
-		}
-	}
-	else
-	{
-		EXIT_ON_ERROR(m->m_enum->GetDefaultAudioEndpoint(m->m_port == Measure::PORT_OUTPUT ? eRender : eCapture, eConsole, &m->m_dev));
-	}
+	m->m_notificationClient = new DefaultDeviceNotificationClient(m);
+	EXIT_ON_ERROR(m->m_enum->RegisterEndpointNotificationCallback(m->m_notificationClient));
 
 	// init the device (if it fails, log debug message and quit)
 	if (m->DeviceInit() == S_OK)
@@ -453,6 +538,14 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 
 Exit:
 
+	if (m->m_notificationClient)
+	{
+		if (m->m_enum)
+		{
+			m->m_enum->UnregisterEndpointNotificationCallback(m->m_notificationClient);
+		}
+		SAFE_RELEASE(m->m_notificationClient);
+	}
 	SAFE_RELEASE(m->m_enum);
 }
 
@@ -468,13 +561,22 @@ PLUGIN_EXPORT void Finalize(void* data)
 
 	if (!m->m_parent)
 	{
-		SetEvent(m->m_hStopEvent);
-
 		m->DeviceRelease();
+		if (m->m_notificationClient)
+		{
+			if (m->m_enum)
+			{
+				m->m_enum->UnregisterEndpointNotificationCallback(m->m_notificationClient);
+			}
+			SAFE_RELEASE(m->m_notificationClient);
+		}
 		SAFE_RELEASE(m->m_enum);
 
 		std::vector<Measure*>::iterator iter = std::find(s_parents.begin(), s_parents.end(), m);
-		s_parents.erase(iter);
+		if (iter != s_parents.end())
+		{
+			s_parents.erase(iter);
+		}
 	}
 
 	delete m;
@@ -541,16 +643,16 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		{
 			WCHAR msg[512];
 			WCHAR* d = msg;
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+			d += _snwprintf_s(d, _countof(msg) - (d - msg), _TRUNCATE,
 				L"Invalid Type '%s', must be one of:", type);
 
 			for (int i = 0; i < Measure::NUM_TYPES; ++i)
 			{
-				d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+				d += _snwprintf_s(d, _countof(msg) - (d - msg), _TRUNCATE,
 					L"%s%s%s", i ? L", " : L" ", i == (Measure::NUM_TYPES - 1) ? L"or " : L"", s_typeName[i]);
 			}
 
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
+			d += _snwprintf_s(d, _countof(msg) - (d - msg), _TRUNCATE, L".");
 			RmLogF(rm, LOG_ERROR, msg);
 		}
 	}
@@ -577,16 +679,16 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		{
 			WCHAR msg[512];
 			WCHAR* d = msg;
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+			d += _snwprintf_s(d, _countof(msg) - (d - msg), _TRUNCATE,
 				L"Invalid Channel '%s', must be an integer between 0 and %d, or one of:", channel, Measure::MAX_CHANNELS - 2);
 
 			for (int i = 0; i <= Measure::CHANNEL_SUM; ++i)
 			{
-				d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+				d += _snwprintf_s(d, _countof(msg) - (d - msg), _TRUNCATE,
 					L"%s%s%s", i ? L", " : L" ", i == Measure::CHANNEL_SUM ? L"or " : L"", s_chanName[i][0]);
 			}
 
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
+			d += _snwprintf_s(d, _countof(msg) - (d - msg), _TRUNCATE, L".");
 			RmLogF(rm, LOG_ERROR, msg);
 		}
 	}
@@ -612,7 +714,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			m->m_smoothing		!= smoothing)
 		{
 			// initialize FFT data
-			if (m->m_fftSize < 0 || m->m_fftSize & 1)
+			if (fftSize < 0 || fftSize & 1)
 			{
 				RmLogF(rm, LOG_ERROR, L"Invalid FFTSize %ld: must be an even integer >= 0. (powers of 2 work best)", fftSize);
 				fftSize = 0;
@@ -621,7 +723,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			m->m_fftBufferSize = fftBufferSize;
 
 			// initialize WAVE data
-			if (m->m_waveSize < 0 || m->m_waveSize & 1)
+			if (waveSize < 0 || waveSize & 1)
 			{
 				RmLogF(rm, LOG_ERROR, L"Invalid WAVESize %ld: must be an even integer >= 0.", waveSize);
 				waveSize = 0;
@@ -649,73 +751,10 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			m->m_freqMin = freqMin;
 			m->m_freqMax = freqMax;
 
-			// setup ring buffer
-			if (m->m_ringBufferSize)
+			m->DeviceRelease(true, true);
+			if (m->SelectDevice() != S_OK || m->DeviceInit() != S_OK || m->InitializeAnalysisBuffers() != S_OK)
 			{
-				m->m_ringBuffer = (float*)calloc(m->m_ringBufferSize * sizeof(float), 1);
-				m->m_ringBufOut = (float*)calloc(max(m->m_ringBufferSize, m->m_fftBufferSize) * sizeof(float), 1);
-			}
-
-			// setup FFT buffers
-			if (m->m_fftSize)
-			{
-				m->m_fftKWdw = (float*)calloc(m->m_fftSize * sizeof(float), 1);
-
-				m->m_fftCfg = pffft_new_setup(m->m_fftBufferSize, pffft_transform_t::PFFFT_REAL);
-				m->m_fftTmpOut = (float*)calloc(m->m_fftBufferSize * 2 * sizeof(float), 1);
-
-				m->m_fftOut = (float*)calloc(m->m_fftBufferSize * sizeof(float), 1);
-
-				m->m_fftScalar = (float)(1.0 / sqrt(m->m_fftSize));
-				m->m_df = (float)m->m_wfx->nSamplesPerSec / m->m_fftBufferSize;
-
-				// zero-padding - https://jackschaedler.github.io/circles-sines-signals/zeropadding.html
-				for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin) m->m_ringBufOut[iBin] = 0.0;
-
-				// calculate window function coefficients (http://en.wikipedia.org/wiki/Window_function#Hann_.28Hanning.29_window)
-				for (unsigned int iBin = 1; iBin < m->m_fftSize; ++iBin)
-					m->m_fftKWdw[iBin] = (float)(0.5 * (1.0 - cos(TWOPI * iBin / (m->m_fftSize + 1))));		// periodic version for FFT/spectral analysis
-				m->m_fftKWdw[0] = 0.0;
-
-				// calculate band frequencies and allocate band output buffers
-				if (m->m_nBands)
-				{
-					m->m_bandFreq = (float*)malloc(m->m_nBands * sizeof(float));
-					const double step = pow(2.0, (log(m->m_freqMax / m->m_freqMin) / m->m_nBands) / log(2.0));
-					m->m_bandFreq[0] = (float)(m->m_freqMin * step);
-
-					m->m_bandScalar = 2.0f / (float)m->m_wfx->nSamplesPerSec;
-					m->m_bandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
-
-					for (int iBand = 1; iBand < m->m_nBands; ++iBand)
-					{
-						m->m_bandFreq[iBand] = (float)(m->m_bandFreq[iBand - 1] * step);
-					}
-
-					if (m->m_smoothing) 
-					{
-						m->m_bandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
-					}
-				}
-			}
-
-			// setup WAVE buffers
-			if (m->m_waveSize)
-			{
-				m->m_waveOut = (float*)calloc(m->m_waveSize * sizeof(float), 1);
-
-				if (m->m_nBands)
-				{
-					m->m_dw = (float)m->m_waveSize / (float)m->m_nBands;
-					m->m_waveScalar = (float)(1.0f / m->m_dw);
-					m->m_waveBandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
-
-					// smoothing needs an additional temp buffer
-					if (m->m_smoothing)
-					{
-						m->m_waveBandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
-					}
-				}
+				RmLog(rm, LOG_ERROR, L"Failed to initialize audio analysis buffers.");
 			}
 		}
 
@@ -762,15 +801,20 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 
 		if (!m->m_updateLoopThread && m->m_updatesPerSecond != -2)
 		{
-			// create separate thread with event-driven update loop
-			m->m_updateLoopThread = new std::thread(&Measure::DoCaptureLoop, m);
-			m->m_updateLoopThread->detach();
+			m->StartCaptureThread();
 		}
 		else if (m->m_updateLoopThread && m->m_updatesPerSecond == -2) 
 		{
-			SetEvent(m->m_hStopEvent);
-			//m->m_updateLoopThread->join();
-			//delete m->m_updateLoopThread;
+			if (m->m_hStopEvent)
+			{
+				SetEvent(m->m_hStopEvent);
+			}
+			if (m->m_updateLoopThread->joinable())
+			{
+				m->m_updateLoopThread->join();
+			}
+			delete m->m_updateLoopThread;
+			m->m_updateLoopThread = NULL;
 		}
 	}
 
@@ -821,11 +865,12 @@ PLUGIN_EXPORT double Update(void* data)
 		case AUDCLNT_E_BUFFER_ERROR:
 		case AUDCLNT_E_DEVICE_INVALIDATED:
 		case AUDCLNT_E_SERVICE_NOT_RUNNING:
-			// error detected, release device
-			m->DeviceRelease();
+			m->ReinitializeDevice();
 			return 0.0;
 		}
 	}
+
+	std::lock_guard<std::mutex> lock(parent->m_mutex);
 
 	switch (m->m_type)
 	{
@@ -850,7 +895,7 @@ PLUGIN_EXPORT double Update(void* data)
 	case Measure::TYPE_FFTFREQ:
 		if (parent->m_clCapture && parent->m_fftBufferSize && m->m_fftIdx <= (parent->m_fftBufferSize * 0.5))
 		{
-			return ((float)m->m_fftIdx) * m->m_df;
+			return ((float)m->m_fftIdx) * parent->m_df;
 		}
 		break;
 
@@ -928,6 +973,7 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 	};
 
 	buffer[0] = '\0';
+	std::lock_guard<std::mutex> lock(parent->m_mutex);
 
 	switch (m->m_type)
 	{
@@ -981,7 +1027,7 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 
 						if (device->GetId(&id) == S_OK && props->GetValue(PKEY_Device_FriendlyName, &varName) == S_OK)
 						{
-							d += _snwprintf_s(d, (sizeof(buffer) + (UINT32)buffer - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+							d += _snwprintf_s(d, _countof(buffer) - (d - buffer), _TRUNCATE,
 								L"%s%s: %s", iDevice > 0 ? L"\n" : L"", id, varName.pwszVal);
 						}
 
@@ -1003,16 +1049,84 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 	return buffer;
 }
 
+UINT32 Measure::EmptyPacketSilenceThreshold() const
+{
+	if (m_updatesPerSecond > 0)
+	{
+		return (UINT32)max(1.0, ceil(m_updatesPerSecond * 0.3));
+	}
+
+	if (m_updatesPerSecond == -2)
+	{
+		return 1;
+	}
+
+	return 6;
+}
+
+void Measure::ZeroOutputBuffers()
+{
+	if (m_bandOut && m_nBands)
+	{
+		memset(m_bandOut, 0, m_nBands * sizeof(float));
+	}
+	if (m_fftOut && m_fftBufferSize)
+	{
+		memset(m_fftOut, 0, m_fftBufferSize * sizeof(float));
+	}
+	if (m_waveOut && m_waveSize)
+	{
+		memset(m_waveOut, 0, m_waveSize * sizeof(float));
+	}
+	if (m_waveBandOut && m_nBands)
+	{
+		memset(m_waveBandOut, 0, m_nBands * sizeof(float));
+	}
+
+	for (int iChan = 0; iChan < MAX_CHANNELS; ++iChan)
+	{
+		m_rms[iChan] = 0.0f;
+		m_peak[iChan] = 0.0f;
+	}
+
+	m_outputsSilenced = true;
+}
+
 HRESULT Measure::UpdateParent()
 {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_clCapture || !m_wfx || !m_bufChunk)
+	{
+		return E_FAIL;
+	}
+
 	BYTE* buffer;
-	UINT32 nFrames, m_nFramesNext;
+	UINT32 nFrames, nFramesNext;
 	DWORD  flags;
 
-	HRESULT hr = m_clCapture->GetNextPacketSize(&m_nFramesNext);
+	HRESULT hr = m_clCapture->GetNextPacketSize(&nFramesNext);
+	m_nFramesNext = nFramesNext;
 	if (hr == S_OK)
 	{
-		if (m_nFramesNext <= 0) return S_FALSE;
+		if (nFramesNext <= 0)
+		{
+			++m_nEmptyPacketCycles;
+			if (m_nEmptyPacketCycles >= EmptyPacketSilenceThreshold())
+			{
+				if (!m_outputsSilenced)
+				{
+					ZeroOutputBuffers();
+					return S_OK;
+				}
+
+				return S_FALSE;
+			}
+
+			return S_FALSE;
+		}
+
+		m_nEmptyPacketCycles = 0;
+		m_outputsSilenced = false;
 		
 		while (m_clCapture->GetBuffer(&buffer, &nFrames, &flags, NULL, NULL) == S_OK)
 		{
@@ -1072,9 +1186,10 @@ HRESULT Measure::UpdateParent()
 			if (m_ringBufferSize)
 			{
 				// store data in ring buffers, demux streams, and measure RMS and peak levels
-				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
+				const int channelsToProcess = min((int)m_wfx->nChannels, (int)Measure::CHANNEL_SUM);
+				for (int iFrame = 0; iFrame < (int)(nFrames * m_wfx->nChannels);)
 				{
-					for (int iChan = 0; iChan < m_wfx->nChannels; ++iChan)
+					for (int iChan = 0; iChan < (int)m_wfx->nChannels; ++iChan)
 					{
 						// store data in ring buffers, and demux streams
 						if (m_channel == Measure::CHANNEL_SUM)
@@ -1084,8 +1199,8 @@ HRESULT Measure::UpdateParent()
 								// cannot increment before evaluation
 								const float L = m_bufChunk[iFrame];
 
-								// stereo to mono: (L + R) / 2
-								m_ringBuffer[m_ringBufW] = 0.5f * (L + m_bufChunk[iFrame+1]);
+								// stereo to mono: (L + R) / 2; mono devices use the first channel.
+								m_ringBuffer[m_ringBufW] = m_wfx->nChannels > 1 ? 0.5f * (L + m_bufChunk[iFrame + 1]) : L;
 							}
 						}
 						else if (iChan == m_channel)
@@ -1098,8 +1213,11 @@ HRESULT Measure::UpdateParent()
 						float x = (float)m_bufChunk[iFrame++];
 						float sqrX = x * x;
 						float absX = abs(x);
-						m_rms[iChan] = sqrX + m_kRMS[(sqrX < m_rms[iChan])] * (m_rms[iChan] - sqrX);
-						m_peak[iChan] = absX + m_kPeak[(absX < m_peak[iChan])] * (m_peak[iChan] - absX);
+						if (iChan < channelsToProcess)
+						{
+							m_rms[iChan] = sqrX + m_kRMS[(sqrX < m_rms[iChan])] * (m_rms[iChan] - sqrX);
+							m_peak[iChan] = absX + m_kPeak[(absX < m_peak[iChan])] * (m_peak[iChan] - absX);
+						}
 					}
 					m_ringBufW = (m_ringBufW + 1) % m_ringBufferSize;	// move along the data-to-process buffer
 				}
@@ -1108,15 +1226,19 @@ HRESULT Measure::UpdateParent()
 			{
 				// measure RMS and peak levels
 				// loops unrolled for float, 16b and mono, stereo
-				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
+				const int channelsToProcess = min((int)m_wfx->nChannels, (int)Measure::CHANNEL_SUM);
+				for (int iFrame = 0; iFrame < (int)(nFrames * m_wfx->nChannels);)
 				{
-					for (int iChan = 0; iChan < m_wfx->nChannels; ++iChan)
+					for (int iChan = 0; iChan < (int)m_wfx->nChannels; ++iChan)
 					{
 						float x = (float)m_bufChunk[iFrame++];
 						float sqrX = x * x;
 						float absX = abs(x);
-						m_rms[iChan] = sqrX + m_kRMS[(sqrX < m_rms[iChan])] * (m_rms[iChan] - sqrX);
-						m_peak[iChan] = absX + m_kPeak[(absX < m_peak[iChan])] * (m_peak[iChan] - absX);
+						if (iChan < channelsToProcess)
+						{
+							m_rms[iChan] = sqrX + m_kRMS[(sqrX < m_rms[iChan])] * (m_rms[iChan] - sqrX);
+							m_peak[iChan] = absX + m_kPeak[(absX < m_peak[iChan])] * (m_peak[iChan] - absX);
+						}
 					}
 				}
 			}
@@ -1171,11 +1293,13 @@ HRESULT Measure::UpdateParent()
 			{
 				if (m_dynamicVolume) 
 				{
+					m_fftMeanSquare = 0.0f;
 					// apply the windowing function and calculate fft sized mean square
-					for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
+					for (int iBin = 0; iBin < m_fftSize; ++iBin)
 					{
-						m_fftMeanSquare += m_ringBufOut[iBin] * m_ringBufOut[iBin];
-						m_ringBufOut[iBin] *= m_fftKWdw[iBin];
+						int src = m_ringBufferSize - m_fftSize + iBin;
+						m_fftMeanSquare += m_ringBufOut[src] * m_ringBufOut[src];
+						m_ringBufOut[src] *= m_fftKWdw[iBin];
 					}
 					m_fftMeanSquare = m_fftMeanSquare / m_fftSize;
 					m_fftMeanSquare *= 10.0F;
@@ -1183,9 +1307,10 @@ HRESULT Measure::UpdateParent()
 				else 
 				{
 					// apply the windowing function
-					for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
+					for (int iBin = 0; iBin < m_fftSize; ++iBin)
 					{
-						m_ringBufOut[iBin] *= m_fftKWdw[iBin];
+						int src = m_ringBufferSize - m_fftSize + iBin;
+						m_ringBufOut[src] *= m_fftKWdw[iBin];
 					}
 				}
 
@@ -1230,7 +1355,7 @@ HRESULT Measure::UpdateParent()
 				float* ptrWaveBuffer = m_smoothing ? m_waveBandTmpOut : m_waveBandOut;
 				memset(ptrWaveBuffer, 0, m_nBands * sizeof(float));
 
-				while (iBin <= m_waveSize && iBand < m_nBands)
+				while (iBin < m_waveSize && iBand < m_nBands)
 				{
 					const float wLin1 = iBin;
 					const float bLin1 = m_dw * (iBand + 1);
@@ -1364,12 +1489,262 @@ HRESULT Measure::UpdateParent()
 *
 * @return		Result value, S_OK on success.
 */
+HRESULT DefaultDeviceNotificationClient::OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId)
+{
+	if (m_measure)
+	{
+		m_measure->OnDefaultDeviceChanged(flow, role, pwstrDefaultDeviceId);
+	}
+	return S_OK;
+}
+
+HRESULT Measure::SelectDevice()
+{
+	if (!m_enum)
+	{
+		m_dev = NULL;
+		return E_FAIL;
+	}
+
+	SAFE_RELEASE(m_dev);
+	m_usingDefaultDevice = false;
+
+	if (*m_reqID)
+	{
+		HRESULT hr = m_enum->GetDevice(m_reqID, &m_dev);
+		if (hr == S_OK && m_dev)
+		{
+			return S_OK;
+		}
+
+		m_dev = NULL;
+		RmLogF(m_rm, LOG_WARNING, L"Audio %s device '%s' not found (error 0x%08x). Falling back to the default device.",
+			m_port == Measure::PORT_OUTPUT ? L"output" : L"input", m_reqID, hr);
+	}
+
+	m_usingDefaultDevice = true;
+	return m_enum->GetDefaultAudioEndpoint(m_port == Measure::PORT_OUTPUT ? eRender : eCapture, eConsole, &m_dev);
+}
+
+void Measure::ReleaseAnalysisBuffers()
+{
+	if (m_fftCfg) pffft_destroy_setup(m_fftCfg);
+	m_fftCfg = NULL;
+
+	if (m_ringBuffer) free(m_ringBuffer);
+	m_ringBuffer = NULL;
+
+	if (m_fftOut) free(m_fftOut);
+	m_fftOut = NULL;
+
+	if (m_fftKWdw) free(m_fftKWdw);
+	m_fftKWdw = NULL;
+
+	if (m_ringBufOut) free(m_ringBufOut);
+	m_ringBufOut = NULL;
+
+	if (m_fftTmpOut) free(m_fftTmpOut);
+	m_fftTmpOut = NULL;
+
+	if (m_bandFreq) free(m_bandFreq);
+	m_bandFreq = NULL;
+
+	if (m_bandOut) free(m_bandOut);
+	m_bandOut = NULL;
+
+	if (m_bandTmpOut) free(m_bandTmpOut);
+	m_bandTmpOut = NULL;
+
+	if (m_waveBandOut) free(m_waveBandOut);
+	m_waveBandOut = NULL;
+
+	if (m_waveOut) free(m_waveOut);
+	m_waveOut = NULL;
+
+	if (m_waveBandTmpOut) free(m_waveBandTmpOut);
+	m_waveBandTmpOut = NULL;
+
+	m_ringBufW = 0;
+	m_fftMeanSquare = 0.0f;
+	m_nEmptyPacketCycles = 0;
+	m_outputsSilenced = true;
+}
+
+HRESULT Measure::InitializeAnalysisBuffers()
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+
+	if (!m_wfx)
+	{
+		return S_FALSE;
+	}
+
+	m_nEmptyPacketCycles = 0;
+	m_outputsSilenced = true;
+
+	if (m_ringBufferSize)
+	{
+		m_ringBuffer = (float*)calloc(m_ringBufferSize, sizeof(float));
+		m_ringBufOut = (float*)calloc(max(m_ringBufferSize, m_fftBufferSize), sizeof(float));
+		if (!m_ringBuffer || !m_ringBufOut)
+		{
+			return E_OUTOFMEMORY;
+		}
+	}
+
+	if (m_fftSize)
+	{
+		m_fftKWdw = (float*)calloc(m_fftSize, sizeof(float));
+		m_fftCfg = pffft_new_setup(m_fftBufferSize, pffft_transform_t::PFFFT_REAL);
+		m_fftTmpOut = (float*)calloc(m_fftBufferSize * 2, sizeof(float));
+		m_fftOut = (float*)calloc(m_fftBufferSize, sizeof(float));
+		if (!m_fftKWdw || !m_fftCfg || !m_fftTmpOut || !m_fftOut)
+		{
+			return E_OUTOFMEMORY;
+		}
+
+		m_fftScalar = (float)(1.0 / sqrt(m_fftSize));
+		m_df = (float)m_wfx->nSamplesPerSec / m_fftBufferSize;
+
+		for (int iBin = 1; iBin < m_fftSize; ++iBin)
+		{
+			m_fftKWdw[iBin] = (float)(0.5 * (1.0 - cos(TWOPI * iBin / (m_fftSize + 1))));
+		}
+		m_fftKWdw[0] = 0.0f;
+
+		if (m_nBands)
+		{
+			if (m_freqMin <= 0.0 || m_freqMax <= m_freqMin)
+			{
+				RmLog(m_rm, LOG_ERROR, L"Invalid frequency range: FreqMin must be > 0 and FreqMax must be greater than FreqMin.");
+				return E_INVALIDARG;
+			}
+
+			m_bandFreq = (float*)malloc(m_nBands * sizeof(float));
+			m_bandOut = (float*)calloc(m_nBands, sizeof(float));
+			if (!m_bandFreq || !m_bandOut)
+			{
+				return E_OUTOFMEMORY;
+			}
+
+			const double step = pow(2.0, (log(m_freqMax / m_freqMin) / m_nBands) / log(2.0));
+			m_bandFreq[0] = (float)(m_freqMin * step);
+			m_bandScalar = 2.0f / (float)m_wfx->nSamplesPerSec;
+			for (int iBand = 1; iBand < m_nBands; ++iBand)
+			{
+				m_bandFreq[iBand] = (float)(m_bandFreq[iBand - 1] * step);
+			}
+
+			if (m_smoothing)
+			{
+				m_bandTmpOut = (float*)calloc(m_nBands, sizeof(float));
+				if (!m_bandTmpOut)
+				{
+					return E_OUTOFMEMORY;
+				}
+			}
+		}
+	}
+
+	if (m_waveSize)
+	{
+		m_waveOut = (float*)calloc(m_waveSize, sizeof(float));
+		if (!m_waveOut)
+		{
+			return E_OUTOFMEMORY;
+		}
+
+		if (m_nBands)
+		{
+			m_dw = (float)m_waveSize / (float)m_nBands;
+			m_waveScalar = (float)(1.0f / m_dw);
+			m_waveBandOut = (float*)calloc(m_nBands, sizeof(float));
+			if (!m_waveBandOut)
+			{
+				return E_OUTOFMEMORY;
+			}
+
+			if (m_smoothing)
+			{
+				m_waveBandTmpOut = (float*)calloc(m_nBands, sizeof(float));
+				if (!m_waveBandTmpOut)
+				{
+					return E_OUTOFMEMORY;
+				}
+			}
+		}
+	}
+
+	return S_OK;
+}
+
+void Measure::StartCaptureThread()
+{
+	if (!m_updateLoopThread && m_hReadyEvent && m_hStopEvent && m_updatesPerSecond != -2)
+	{
+		m_updateLoopThread = new std::thread(&Measure::DoCaptureLoop, this);
+	}
+}
+
+void Measure::OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR defaultDeviceId)
+{
+	if (!m_usingDefaultDevice || role != eConsole)
+	{
+		return;
+	}
+
+	if ((m_port == PORT_OUTPUT && flow != eRender) || (m_port == PORT_INPUT && flow != eCapture))
+	{
+		return;
+	}
+
+	RmLog(m_rm, LOG_DEBUG, L"Default audio device changed; reinitializing AudioLevelBeta.");
+	ReinitializeDevice();
+}
+
+HRESULT Measure::ReinitializeDevice()
+{
+	bool currentThread = m_updateLoopThread && m_updateLoopThread->get_id() == std::this_thread::get_id();
+	DeviceRelease(!currentThread, true);
+
+	HRESULT hr = SelectDevice();
+	if (FAILED(hr))
+	{
+		RmLogF(m_rm, LOG_ERROR, L"AudioLevel: Failed to select audio device after reinitialization. HRESULT %d", (int)hr);
+		return hr;
+	}
+
+	hr = DeviceInit();
+	if (FAILED(hr))
+	{
+		return hr;
+	}
+
+	hr = InitializeAnalysisBuffers();
+	if (FAILED(hr))
+	{
+		RmLogF(m_rm, LOG_ERROR, L"AudioLevel: Failed to initialize analysis buffers after device change. HRESULT %d", (int)hr);
+		return hr;
+	}
+
+	if (!currentThread)
+	{
+		StartCaptureThread();
+	}
+
+	return S_OK;
+}
+
 HRESULT	Measure::DeviceInit()
 {
 	HRESULT hr;
 
 	// get the device handle
-	assert(m_enum && m_dev);
+	if (!m_enum || !m_dev)
+	{
+		RmLog(m_rm, LOG_WARNING, L"AudioLevel: Cannot initialize audio device because no endpoint is selected.");
+		return E_FAIL;
+	}
 
 	// store device name
 	IPropertyStore* props = NULL;
@@ -1393,6 +1768,7 @@ HRESULT	Measure::DeviceInit()
 	if (hr != S_OK)
 	{
 		RmLog(m_rm, LOG_WARNING, L"Failed to create audio client for loopback events.");
+		goto Exit;
 	}
 
 	// get the main audio client
@@ -1414,47 +1790,76 @@ HRESULT	Measure::DeviceInit()
 	m_wfxR.cbSize = 0;
 
 	CoTaskMemFree(m_wfx);
+	m_wfx = NULL;
+	m_wfxAllocated = false;
 
 	m_wfxR.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
 	m_wfxR.wBitsPerSample = 32;
 	m_wfxR.nBlockAlign = m_wfxR.nChannels * m_wfxR.wBitsPerSample / 8;
 	m_wfxR.nAvgBytesPerSec = m_wfxR.nSamplesPerSec * m_wfxR.nBlockAlign;
 
-	if (m_clAudio->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &m_wfxR, &m_wfx) != AUDCLNT_E_UNSUPPORTED_FORMAT)
+	WAVEFORMATEX* closestMatch = NULL;
+	hr = m_clAudio->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &m_wfxR, &closestMatch);
+	if (hr == S_OK)
 	{
 		m_format = FMT_PCM_F32;
+		m_wfx = &m_wfxR;
+		m_wfxAllocated = false;
 	}
 	else
 	{
+		if (closestMatch)
+		{
+			CoTaskMemFree(closestMatch);
+			closestMatch = NULL;
+		}
+
 		m_wfxR.wFormatTag = WAVE_FORMAT_PCM;
 		m_wfxR.wBitsPerSample = 16;
 		m_wfxR.nBlockAlign = m_wfxR.nChannels * m_wfxR.wBitsPerSample / 8;
 		m_wfxR.nAvgBytesPerSec = m_wfxR.nSamplesPerSec * m_wfxR.nBlockAlign;
 
-		if (m_clAudio->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &m_wfxR, &m_wfx) != AUDCLNT_E_UNSUPPORTED_FORMAT)
+		hr = m_clAudio->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &m_wfxR, &closestMatch);
+		if (hr == S_OK)
 		{
 			m_format = FMT_PCM_S16;
+			m_wfx = &m_wfxR;
+			m_wfxAllocated = false;
 		}
 		else
 		{
+			if (closestMatch)
+			{
+				CoTaskMemFree(closestMatch);
+				closestMatch = NULL;
+			}
+
 			// try a standard format
 			m_wfxR.nChannels = 2;
 			m_wfxR.nSamplesPerSec = 48000;
 			m_wfxR.nBlockAlign = m_wfxR.nChannels * m_wfxR.wBitsPerSample / 8;
 			m_wfxR.nAvgBytesPerSec = m_wfxR.nSamplesPerSec * m_wfxR.nBlockAlign;
 
-			if (m_clAudio->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &m_wfxR, &m_wfx) != AUDCLNT_E_UNSUPPORTED_FORMAT)
+			hr = m_clAudio->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &m_wfxR, &closestMatch);
+			if (hr == S_OK)
 			{
 				m_format = FMT_PCM_S16;
+				m_wfx = &m_wfxR;
+				m_wfxAllocated = false;
 			}
 			else
 			{
+				if (closestMatch)
+				{
+					CoTaskMemFree(closestMatch);
+					closestMatch = NULL;
+				}
 				RmLog(m_rm, LOG_WARNING, L"Invalid sample format.  Only PCM 16b integer or PCM 32b float are supported.");
+				hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
 				goto Exit;
 			}
 		}
 	}
-	if (!m_wfx) { m_wfx = &m_wfxR; }
 
 	hr = m_clBugAudio->Initialize(
 		AUDCLNT_SHAREMODE_SHARED,
@@ -1480,6 +1885,12 @@ HRESULT	Measure::DeviceInit()
 		}
 
 		m_hStopEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+		if (m_hStopEvent == NULL)
+		{
+			RmLog(m_rm, LOG_WARNING, L"Failed to create stop-event handle.");
+			hr = E_FAIL;
+			goto Exit;
+		}
 
 		hr = m_clBugAudio->SetEventHandle(m_hReadyEvent);
 
@@ -1584,7 +1995,12 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
-	m_bufChunk = (float*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(float), 1);
+	m_bufChunk = (float*)calloc(nMaxFrames * m_wfx->nChannels, sizeof(float));
+	if (!m_bufChunk)
+	{
+		hr = E_OUTOFMEMORY;
+		goto Exit;
+	}
 
 	return S_OK;
 
@@ -1598,9 +2014,24 @@ Exit:
 /**
 * Release handles to audio resources.  (except the enumerator)
 */
-void Measure::DeviceRelease()
+void Measure::DeviceRelease(bool stopThread, bool releaseProcessing)
 {
+	bool currentThread = m_updateLoopThread && m_updateLoopThread->get_id() == std::this_thread::get_id();
+	if (stopThread && m_updateLoopThread && !currentThread)
+	{
+		if (m_hStopEvent)
+		{
+			SetEvent(m_hStopEvent);
+		}
+		if (m_updateLoopThread->joinable())
+		{
+			m_updateLoopThread->join();
+		}
+		delete m_updateLoopThread;
+		m_updateLoopThread = NULL;
+	}
 
+	std::lock_guard<std::mutex> lock(m_mutex);
 	RmLog(m_rm, LOG_DEBUG, L"Releasing dummy stream audio device.");
 	if (m_clBugAudio)
 	{
@@ -1622,38 +2053,15 @@ void Measure::DeviceRelease()
 	SAFE_RELEASE(m_clAudio);
 	SAFE_RELEASE(m_dev);
 
-	if (m_hReadyEvent != NULL) { CloseHandle(m_hReadyEvent); }
-	if (m_hStopEvent != NULL) { CloseHandle(m_hStopEvent); }
-	//if (m_hTask != NULL) { AvRevertMmThreadCharacteristics(m_hTask); }
-
-	delete m_updateLoopThread;
-
-	if (m_fftCfg) pffft_destroy_setup(m_fftCfg);
-	m_fftCfg = NULL;
+	if (m_hReadyEvent != NULL) { CloseHandle(m_hReadyEvent); m_hReadyEvent = NULL; }
+	if (m_hStopEvent != NULL) { CloseHandle(m_hStopEvent); m_hStopEvent = NULL; }
 
 	if (m_bufChunk) free(m_bufChunk);
 	m_bufChunk = NULL;
-
-	if (m_ringBuffer) free(m_ringBuffer);
-	m_ringBuffer = NULL;
-
-	if (m_fftOut) free(m_fftOut);
-	m_fftOut = NULL;
-
-	if (m_bandOut) free(m_bandOut);
-	m_bandOut = NULL;
-
-	if (m_bandTmpOut) free(m_bandTmpOut);
-	m_bandTmpOut = NULL;
-
-	if (m_waveBandOut) free(m_waveBandOut);
-	m_waveBandOut = NULL;
-
-	if (m_waveOut) free(m_waveOut);
-	m_waveOut = NULL;
-
-	if (m_waveBandTmpOut) free(m_waveBandTmpOut);
-	m_waveBandTmpOut = NULL;
+	m_nFramesNext = 0;
+	m_nSilentFrames = 0;
+	m_nEmptyPacketCycles = 0;
+	m_outputsSilenced = true;
 
 	for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
 	{
@@ -1661,20 +2069,16 @@ void Measure::DeviceRelease()
 		m_peak[iChan] = 0.0;
 	}
 
-	if (m_bandFreq)
+	if (m_wfxAllocated && m_wfx)
 	{
-		free(m_bandFreq);
-		m_bandFreq = NULL;
+		CoTaskMemFree(m_wfx);
 	}
+	m_wfx = NULL;
+	m_wfxAllocated = false;
 
-	if (m_fftTmpOut)
+	if (releaseProcessing)
 	{
-		free(m_fftTmpOut);
-		free(m_ringBufOut);
-		free(m_fftKWdw);
-		m_fftTmpOut = NULL;
-		m_ringBufOut = NULL;
-		m_fftKWdw = NULL;
+		ReleaseAnalysisBuffers();
 	}
 
 	m_devName[0] = '\0';
