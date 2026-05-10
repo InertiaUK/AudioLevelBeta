@@ -192,6 +192,7 @@ struct Measure
 	int						m_dynamicVolume;			// enable dynamic volume (parsed from options)
 	UINT32					m_nFramesNext;				// number of frames obtained on the UpdateParent call
 	UINT32					m_nSilentFrames;			// number of silent frames, used to calculate when to stop updating
+	UINT32					m_nEmptyPacketCycles;		// number of update cycles with no available packets
 	double					m_gainRMS;					// RMS gain (parsed from options)
 	double					m_gainPeak;					// peak gain (parsed from options)
 	double					m_freqMin;					// min freq for band measurement
@@ -254,6 +255,7 @@ struct Measure
 	float					m_smoothingScalar;			// smoothing scalar
 	bool					m_wfxAllocated;				// true when m_wfx must be freed with CoTaskMemFree
 	bool					m_usingDefaultDevice;		// true when blank ID or requested ID fallback uses default device
+	bool					m_outputsSilenced;			// true after stale output buffers have been cleared
 	DefaultDeviceNotificationClient*
 							m_notificationClient;		// default endpoint change callback
 
@@ -280,6 +282,7 @@ struct Measure
 		m_ringBufferSize(0),
 		m_nFramesNext(0),
 		m_nSilentFrames(0),
+		m_nEmptyPacketCycles(0),
 		m_dynamicVolume(0),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
@@ -314,6 +317,7 @@ struct Measure
 		m_bandFreq(NULL),
 		m_wfxAllocated(false),
 		m_usingDefaultDevice(false),
+		m_outputsSilenced(true),
 		m_notificationClient(NULL)
 	{
 		m_envRMS[0] = 300;
@@ -351,6 +355,8 @@ struct Measure
 	void StartCaptureThread();
 	void OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR defaultDeviceId);
 	HRESULT ReinitializeDevice();
+	UINT32 EmptyPacketSilenceThreshold() const;
+	void ZeroOutputBuffers();
 	HRESULT UpdateParent();
 
 	void DoCaptureLoop();
@@ -383,12 +389,18 @@ void Measure::DoCaptureLoop()
 	while (1)
 	{
 		HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
-		DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, INFINITE);
+		DWORD waitTimeout = 50;
+		if (m_updatesPerSecond > 0)
+		{
+			waitTimeout = (DWORD)max(1.0, ceil(1000.0 / m_updatesPerSecond));
+		}
+
+		DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, waitTimeout);
 		if (waitResult == WAIT_OBJECT_0 + 1)
 		{
 			break;
 		}
-		if (waitResult != WAIT_OBJECT_0)
+		if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_TIMEOUT)
 		{
 			break;
 		}
@@ -1037,6 +1049,49 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 	return buffer;
 }
 
+UINT32 Measure::EmptyPacketSilenceThreshold() const
+{
+	if (m_updatesPerSecond > 0)
+	{
+		return (UINT32)max(1.0, ceil(m_updatesPerSecond * 0.3));
+	}
+
+	if (m_updatesPerSecond == -2)
+	{
+		return 1;
+	}
+
+	return 6;
+}
+
+void Measure::ZeroOutputBuffers()
+{
+	if (m_bandOut && m_nBands)
+	{
+		memset(m_bandOut, 0, m_nBands * sizeof(float));
+	}
+	if (m_fftOut && m_fftBufferSize)
+	{
+		memset(m_fftOut, 0, m_fftBufferSize * sizeof(float));
+	}
+	if (m_waveOut && m_waveSize)
+	{
+		memset(m_waveOut, 0, m_waveSize * sizeof(float));
+	}
+	if (m_waveBandOut && m_nBands)
+	{
+		memset(m_waveBandOut, 0, m_nBands * sizeof(float));
+	}
+
+	for (int iChan = 0; iChan < MAX_CHANNELS; ++iChan)
+	{
+		m_rms[iChan] = 0.0f;
+		m_peak[iChan] = 0.0f;
+	}
+
+	m_outputsSilenced = true;
+}
+
 HRESULT Measure::UpdateParent()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -1053,7 +1108,25 @@ HRESULT Measure::UpdateParent()
 	m_nFramesNext = nFramesNext;
 	if (hr == S_OK)
 	{
-		if (nFramesNext <= 0) return S_FALSE;
+		if (nFramesNext <= 0)
+		{
+			++m_nEmptyPacketCycles;
+			if (m_nEmptyPacketCycles >= EmptyPacketSilenceThreshold())
+			{
+				if (!m_outputsSilenced)
+				{
+					ZeroOutputBuffers();
+					return S_OK;
+				}
+
+				return S_FALSE;
+			}
+
+			return S_FALSE;
+		}
+
+		m_nEmptyPacketCycles = 0;
+		m_outputsSilenced = false;
 		
 		while (m_clCapture->GetBuffer(&buffer, &nFrames, &flags, NULL, NULL) == S_OK)
 		{
@@ -1493,6 +1566,8 @@ void Measure::ReleaseAnalysisBuffers()
 
 	m_ringBufW = 0;
 	m_fftMeanSquare = 0.0f;
+	m_nEmptyPacketCycles = 0;
+	m_outputsSilenced = true;
 }
 
 HRESULT Measure::InitializeAnalysisBuffers()
@@ -1503,6 +1578,9 @@ HRESULT Measure::InitializeAnalysisBuffers()
 	{
 		return S_FALSE;
 	}
+
+	m_nEmptyPacketCycles = 0;
+	m_outputsSilenced = true;
 
 	if (m_ringBufferSize)
 	{
@@ -1980,6 +2058,10 @@ void Measure::DeviceRelease(bool stopThread, bool releaseProcessing)
 
 	if (m_bufChunk) free(m_bufChunk);
 	m_bufChunk = NULL;
+	m_nFramesNext = 0;
+	m_nSilentFrames = 0;
+	m_nEmptyPacketCycles = 0;
+	m_outputsSilenced = true;
 
 	for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
 	{
