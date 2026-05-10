@@ -1,40 +1,124 @@
 # AudioLevelBeta
-This is an improved beta version of the AudioLevel rainmeter plugin.
 
-## Added features
-Here's a list of improved/addded features of AudioLevelBeta compared to the original AudioLevel version: 
-(Optimizations and fixes are not listed)
-#### Silence detection
-The plugin will have almost no CPU/GPU usage if it detects silence.
-#### Dynamic Volume Adjustment
-Same music visualization result for low- and high-volume music. No need anymore to adjust the sensitivity all the time!
-To enable, put 
-`DynamicVolume=1`
-#### Update Rate Limiter
-You can now limit the update rate (Recommended) as rainmeter can crash on the default unlimited framerate if multiple skins are loaded.
-- `UpdatesPerSecond=60`: This will for example update the measures and meters 60 times per second. You can set this to any number under 240. (recommended)
-- `UpdatesPerSecond=0`: This will disable the updating.
-- `UpdatesPerSecond=-1`: Unlimited: The plugin updates as fast as possible. (default) (the highest CPU/GPU usage)
-- `UpdatesPerSecond=-2`: This will disable the updating and the capture thread (legacy AudioLevel behavior). This is the fastest setting of all but the visualization will not look good most of the time.
+A Rainmeter plugin for real-time audio visualisation. Captures the Windows audio loopback and exposes FFT spectrum, RMS, peak, wave, and band data to Rainmeter skins.
 
-Put the update bang for your measures and meters in `OnUpdateAction`, for example `OnUpdateAction=[!UpdateMeasureGroup Audio][!UpdateMeterGroup Bars]`
-#### Wave and WaveBand Types
-You can now set the AudioLevel parent measure type to `Wave` or `WaveBand`.
-The difference between `Wave` and `WaveBand` is that Wave outputs the raw wave without scaling or smoothing.
-I almost always recommend WaveBand.
-##### Wave
-Use the `WaveSize` option to set the WaveSize (similar to FFTSize), recommended values are: 512 to 8192, but you can go higher no problem.
-Use WaveIdx on the child measures to assign them a number between 0 and WaveSize. (Just like FFTIdx)
-##### WaveBand
-Use the `WaveSize` option to set the WaveSize (similar to FFTSize), recommended values are: 512 to 8192, but you can go higher no problem.
-Use the `Bands` option to specify on how much bands the wave should be scaled (for example 50), independent from `WaveSize`.
-Jou can now use the `Smoothing` option.
-Use BandIdx on the child measures to assign them a number from 0 to `Bands`.
-#### Smoothing options
-Measures of type `Band` or `WaveBand` can utilize this smoothing feature.
-Use the `Smoothing` option to specify the amount of negibour values to build the average. For example 3 or 5.
+This is a maintained fork of [thesn10/AudioLevelBeta](https://github.com/thesn10/AudioLevelBeta), which itself builds on the original [AudioLevel plugin](https://docs.rainmeter.net/manual/plugins/audiolevel/) by David Grace. The 1.2.0 release fixes a crash that made the plugin unusable on current Windows 11 builds, adds automatic default device tracking, and clears up a number of other bugs found during the investigation.
 
-## Contributers
-- [SnGmng](https://github.com/SnGmng)
-- [alatsombath](https://github.com/alatsombath)
-- [dgrace](https://docs.rainmeter.net/manual/plugins/audiolevel/)
+Maintained by [Mark Andrews](https://keepcomputing.co.uk).
+
+## Installation
+
+Drop `AudioLevelBeta.dll` into `%APPDATA%\Rainmeter\Plugins\`. Grab the latest build from the [releases page](https://github.com/InertiaUK/AudioLevelBeta/releases). Restart Rainmeter.
+
+## Usage
+
+### Parent measure
+
+```ini
+[Audio]
+Measure=Plugin
+Plugin=AudioLevelBeta
+Port=Output
+ID=
+FFTSize=2048
+FFTBufferSize=16384
+Bands=90
+FreqMin=20
+FreqMax=20000
+Sensitivity=50
+UpdatesPerSecond=60
+OnUpdateAction=[!UpdateMeasureGroup Audio][!UpdateMeterGroup Bars][!Redraw]
+```
+
+Leave `ID=` blank to use the Windows default output device. The plugin will follow device changes automatically — no restart needed if you switch output in Sound settings.
+
+To target a specific device, set `ID=` to the device endpoint ID (use `Type=DeviceList` to enumerate available devices).
+
+### Child measures
+
+```ini
+[Band1]
+Measure=Plugin
+Plugin=AudioLevelBeta
+Parent=Audio
+Type=Band
+BandIdx=0
+
+[RMS]
+Measure=Plugin
+Plugin=AudioLevelBeta
+Parent=Audio
+Type=RMS
+Channel=Sum
+```
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Band` | FFT frequency band value. Use `BandIdx=N`. |
+| `FFT` | Raw FFT bin value. Use `FFTIdx=N`. |
+| `FFTFreq` | Centre frequency of FFT bin N. |
+| `RMS` | RMS level. |
+| `Peak` | Peak level. |
+| `Wave` | Raw waveform sample. Use `WaveIdx=N`. |
+| `WaveBand` | Smoothed waveform band. Use `BandIdx=N`. |
+| `BandFreq` | Centre frequency of band N. |
+| `BufferStatus` | Returns 1 when new audio data is available. Use with `OnUpdateAction`. |
+| `DeviceList` | Returns a newline-separated list of available audio devices. |
+
+### Options (parent measure)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `Port` | `Output` | `Output` for loopback capture, `Input` for microphone. |
+| `ID` | *(blank)* | Device endpoint ID. Blank = Windows default output. |
+| `Channel` | `Sum` | `L`, `R`, `C`, `Sum`, `Avg`, or channel number. |
+| `FFTSize` | `256` | FFT window size. Higher = more frequency resolution. |
+| `FFTBufferSize` | `0` | Ring buffer size for FFT. |
+| `FFTAttack` / `FFTDecay` | `300` | Smoothing time constants in ms. |
+| `Bands` | `0` | Number of frequency bands. |
+| `FreqMin` / `FreqMax` | `20` / `20000` | Frequency range in Hz. |
+| `Sensitivity` | `35` | dB sensitivity for FFT output. |
+| `AverageSize` | `1` | Number of FFT frames to average. |
+| `UpdatesPerSecond` | `-1` | Max update rate. `60` recommended. `-1` = unlimited. `-2` = legacy mode. |
+| `DynamicVolume` | `0` | Normalises output across volume levels. |
+| `WaveSize` | `256` | Wave/WaveBand buffer size. |
+| `Smoothing` | `0` | Band/WaveBand neighbour averaging. |
+
+## Building
+
+Requires Visual Studio 2022 and the [Rainmeter Plugin SDK](https://github.com/rainmeter/rainmeter-plugin-sdk). The SDK's `API` folder must sit two directories above the project file.
+
+```
+E:\
+  API\
+    RainmeterAPI.h
+    x64\Rainmeter.lib
+    x32\Rainmeter.lib
+  Source Code\
+    AudioLevelBeta\
+      PluginAudioLevelBeta.vcxproj
+```
+
+Build x64 Release:
+
+```
+MSBuild PluginAudioLevelBeta.vcxproj /p:Configuration=Release /p:Platform=x64
+```
+
+The DLL is written directly to `%APPDATA%\Rainmeter\Plugins\`.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## Licence
+
+GPL-2.0. See [LICENSE](LICENSE).
+
+## Credits
+
+- Original AudioLevel plugin: [David Grace](https://docs.rainmeter.net/manual/plugins/audiolevel/)
+- AudioLevelBeta: [thesn10](https://github.com/thesn10/AudioLevelBeta), [SnGmng](https://github.com/SnGmng), [alatsombath](https://github.com/alatsombath)
+- 1.2.0 fixes: [Mark Andrews](https://keepcomputing.co.uk)

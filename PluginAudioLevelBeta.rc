@@ -8,7 +8,7 @@
 //
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1, 1, 8, 6
+FILEVERSION 1, 2, 0, 0
 PRODUCTVERSION 3, 0, 2, 2161
 FILEFLAGSMASK 0x17L
 #ifdef _DEBUG
@@ -24,8 +24,8 @@ BLOCK "StringFileInfo"
 BEGIN
 BLOCK "040904E4"
 BEGIN
-VALUE "FileVersion", "1.1.8.6"
-VALUE "LegalCopyright", "© 2014 - David Grace"
+VALUE "FileVersion", "1.2.0"
+VALUE "LegalCopyright", "ï¿½ 2014 - David Grace"
 
 // Don't change the entries below!
 VALUE "ProductName", "Rainmeter"
